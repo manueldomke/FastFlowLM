@@ -21,6 +21,57 @@
 #include "server.hpp"
 
 namespace {
+
+/// The top-k of the first generated token, shaped as a logprobs object.
+///
+/// Both /v1/chat/completions and /v1/completions used to write a hard-coded
+/// {"logprobs", nullptr}. The values were available all along -- the sampler
+/// keeps the top-k of every sampled token with id, logit and probability --
+/// they were simply never carried to the response. For a model that decides
+/// rather than writes, that is the difference between the chosen option and
+/// the chosen option with its confidence.
+///
+/// Three fields, because they are three different things:
+///   logit    raw, without temperature -- a caller that applies its own
+///            temperature needs this
+///   prob     softmax over the SHOWN top-k, not over the whole vocabulary
+///   logprob  log(prob), for OpenAI-shaped clients
+static json logprobs_from_meta(const chat_meta_info_t& meta_info) {
+    if (meta_info.top_logprobs.empty()) {
+        return nullptr;
+    }
+    json top = json::array();
+    json chosen = json::object();
+    bool chosen_found = false;
+    for (const auto& e : meta_info.top_logprobs) {
+        json entry = {
+            {"token", e.token},
+            {"token_id", e.token_id},
+            {"logit", e.logit},
+            {"prob", e.prob},
+        };
+        // log(0) is -inf, which is not valid JSON.
+        entry["logprob"] = e.prob > 0.0f ? std::log(e.prob) : -1e30;
+        if (e.token_id == meta_info.chosen_token_id) {
+            chosen = entry;
+            chosen_found = true;
+        }
+        top.push_back(std::move(entry));
+    }
+    if (!chosen_found) {
+        // The sampler draws from the top-k, so this should not happen -- but a
+        // caller should not be left without the field over it.
+        chosen = json{{"token", ""},
+                      {"token_id", meta_info.chosen_token_id},
+                      {"logit", nullptr},
+                      {"prob", nullptr},
+                      {"logprob", nullptr}};
+    }
+    chosen["top_logprobs"] = top;
+    return json{{"content", json::array({chosen})}};
+
+}
+
 json ModelErrorResponse(const ModelRequestError& error) {
     return {{"error", {{"message", error.what()},
                        {"type", "model_error"},
@@ -632,7 +683,7 @@ json RestHandler::build_nstream_response(std::string response_text, chat_meta_in
         {
             {"index", 0},
             {"message", message},
-            {"logprobs", nullptr},
+            {"logprobs", logprobs_from_meta(meta_info)},
             {"finish_reason", stop_reason_to_string(meta_info.stop_reason)}
         }
     });
@@ -1587,7 +1638,7 @@ void RestHandler::handle_openai_completion(const json& request,
                     {
                         {"text", response_text},
                         {"index", 0},
-                        {"logprobs", nullptr},
+                        {"logprobs", logprobs_from_meta(meta_info)},
                         {"finish_reason", stop_reason_to_string(meta_info.stop_reason)}
                     }
                 })},

@@ -445,7 +445,19 @@ int Sampler::sample_greedy(buffer<bf16>& x) {
 int Sampler::sample(buffer<bf16>& x) {
     // PRNG is seeded once at construction, no per-call seeding needed
     if (this->top_k == 1) {
-        return sample_greedy(x);
+        int winner = sample_greedy(x);
+        // Leave a trace here too: a client asking for logprobs=1 would
+        // otherwise get an empty list. The raw logit is not available on the
+        // greedy path -- it is never materialised -- hence 0.0 and a
+        // probability of 1.0. Callers who need the distribution ask with
+        // top_k > 1.
+        this->last_top_k.clear();
+        logits_t entry;
+        entry.token_id = winner;
+        entry.logits = 0.0f;
+        entry.prob = 1.0f;
+        this->last_top_k.push_back(entry);
+        return winner;
     }
 
     // COPY FROM `x` → `this->logits[]`
@@ -468,8 +480,37 @@ int Sampler::sample(buffer<bf16>& x) {
     }
     #endif
 
+    // Raw copy BEFORE the penalties, see below.
+    std::vector<float> unpenalised = this->logits;
+
     sampler_penalty_apply_sparse();
     sampler_topk_apply(this->top_k);
+
+    // The top-k for /v1/*/logprobs comes from the UNPENALISED logits.
+    //
+    // sampler_penalty_apply_sparse() subtracts from every token that occurred
+    // in the prompt. For a model that answers with a single letter, those are
+    // the option letters themselves: they all appear in the option list, and
+    // each is pushed down by however often it occurs. The result is a flat,
+    // skewed distribution -- on a "30 against 0.5" task the correct answer sat
+    // at p=0.34 instead of 0.99, while the reference reaches 0.997.
+    //
+    // The penalties are right for text generation; for reading a decision out
+    // of a single token they are harmful. They stay in force for the sampling
+    // itself -- only what is REPORTED is unpenalised. top_k_logits is what
+    // sampler_temp_apply, sampler_topp_apply, sampler_minp_apply and
+    // sample_from_probs all read, so the snapshot has to put it back, or the
+    // draw would come from the unpenalised distribution and repetition
+    // penalties would stop working for ordinary text.
+    logits_list_t penalised_top_k = this->top_k_logits;
+    {
+        std::swap(this->logits, unpenalised);
+        sampler_topk_apply(this->top_k);
+        this->last_top_k = this->top_k_logits;
+        std::swap(this->logits, unpenalised);
+    }
+    this->top_k_logits = std::move(penalised_top_k);
+
     if (this->use_optimized_sampling) {
         softmax_with_topp_minp(this->top_p, this->min_p);
         sampler_temp_apply(this->temperature);

@@ -485,6 +485,90 @@ void AutoModel::_apply_tool_choice_mask(buffer<bf16>& y, const chat_meta_info_t&
     y[tool_start_token_id] = bf16(-1e30f);
 }
 
+/// Returns true if the string is valid UTF-8.
+///
+/// Needed because a token can be the start of a multi-byte sequence: decoded
+/// on its own it is not valid text, and nlohmann::json throws while
+/// serialising. A request with top_k=64 aborted on exactly that.
+static bool is_valid_utf8(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t n;
+        if (c < 0x80)        { n = 1; }
+        else if ((c & 0xE0) == 0xC0) { n = 2; }
+        else if ((c & 0xF0) == 0xE0) { n = 3; }
+        else if ((c & 0xF8) == 0xF0) { n = 4; }
+        else                 { return false; }
+        if (i + n > s.size()) { return false; }
+        for (size_t k = 1; k < n; k++) {
+            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) {
+                return false;
+            }
+        }
+        i += n;
+    }
+    return true;
+}
+
+void AutoModel::_record_top_logprobs(chat_meta_info_t& meta_info, int sampled_token) {
+    // The FIRST generated token only; later calls do nothing.
+    //
+    // A model that answers with a single token puts its decision there -- it
+    // writes its letter right after the answer slot. Recording the last token
+    // instead returns the distribution of whatever follows: with max_tokens=1
+    // that was the full stop after the letter, and the most likely entry read
+    // "." rather than "A". The reference reads at the same position.
+    if (!meta_info.top_logprobs.empty()) {
+        return;
+    }
+    if (!this->sampler || this->sampler->last_top_k.empty()) {
+        return;
+    }
+
+    meta_info.chosen_token_id = sampled_token;
+
+    const auto& src = this->sampler->last_top_k;
+
+    // Softmax over the entries shown, not over the whole vocabulary -- the
+    // remaining tens of thousands are not available here. The sum is
+    // therefore 1 only across the top-k; callers who need the true
+    // distribution continue from `logit`. The temperature is left out, as
+    // the reference for such models expects.
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (const auto& l : src) {
+        if (l.logits > max_logit) {
+            max_logit = l.logits;
+        }
+    }
+    float sum = 0.0f;
+    std::vector<float> weights(src.size());
+    for (size_t i = 0; i < src.size(); i++) {
+        weights[i] = std::exp(src[i].logits - max_logit);
+        sum += weights[i];
+    }
+
+    meta_info.top_logprobs.reserve(src.size());
+    for (size_t i = 0; i < src.size(); i++) {
+        top_logprob_t entry;
+        entry.token_id = src[i].token_id;
+        // Decode here, not in the handler: that one has no tokenizer.
+        //
+        // And check that valid UTF-8 comes out. A token can be the start of a
+        // multi-byte sequence; decoded on its own it is not valid text, and
+        // nlohmann::json throws while serialising:
+        //   [json.exception.type_error.316] incomplete UTF-8 string
+        // The id remains the only hint in that case, and the caller has it.
+        std::string raw = this->tokenizer
+            ? this->tokenizer->run_time_decoder(src[i].token_id)
+            : std::string();
+        entry.token = is_valid_utf8(raw) ? raw : std::string();
+        entry.logit = src[i].logits;
+        entry.prob = sum > 0.0f ? weights[i] / sum : 0.0f;
+        meta_info.top_logprobs.push_back(entry);
+    }
+}
+
 std::string AutoModel::_shared_generate(chat_meta_info_t& meta_info, int length_limit, std::ostream& os, std::function<bool()> is_cancelled) {
     std::vector<int> sampled_tokens;
     std::string result;

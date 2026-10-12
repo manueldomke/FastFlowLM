@@ -114,6 +114,18 @@ typedef enum {
 	TOOL_CHOICE_NONE    // tool call tokens are masked out of the logits
 } tool_choice_t;
 
+/// One entry of the top-k distribution of a sampled token.
+///
+/// A struct of its own rather than Sampler::logits_t: this header should not
+/// have to know about the sampler. `logit` is the raw value before any
+/// temperature -- callers apply their own.
+struct top_logprob_t {
+    int token_id;
+    std::string token;   ///< already decoded; the REST handler has no tokenizer
+    float logit;
+    float prob;
+};
+
 struct chat_meta_info_t {
 	int max_prefill_len;
     int prompt_tokens;        // whole prompt, cached prefix included
@@ -126,6 +138,16 @@ struct chat_meta_info_t {
     stop_reason_t stop_reason;
 	bool restore_allowed;
 	tool_choice_t tool_choice;
+
+	/// The token the sampler chose for the FIRST generated token, or -1.
+	/// Reported as the anchor of the logprobs object.
+	int chosen_token_id = -1;
+
+	/// Top-k of the FIRST generated token, raw and without temperature.
+	/// Filled by the sampler and reported as logprobs by
+	/// /v1/chat/completions and /v1/completions. Empty when nothing was
+	/// sampled -- for instance on a hit from the KV cache.
+	std::vector<top_logprob_t> top_logprobs;
 
 	chat_meta_info_t() : max_prefill_len(0), prompt_tokens(0), cached_prompt_tokens(0), generated_tokens(0), total_duration(0), load_duration(0), prefill_duration(0), decoding_duration(0), stop_reason(EOT_DETECTED), restore_allowed(false), tool_choice(TOOL_CHOICE_AUTO) {}
 };
@@ -312,6 +334,15 @@ protected:
 	/// \note No-op unless the request asked for tool_choice=none and this model
 	///       reports a tool start token, so the default path is untouched.
 	void _apply_tool_choice_mask(buffer<bf16>& y, const chat_meta_info_t& meta_info);
+
+	/// \brief Copy the top-k of the first sampled token into meta_info.
+	/// \param meta_info the meta information of the chat, which carries them to
+	///        the REST handler and from there into the logprobs field
+	/// \param sampled_token the token the sampler just chose; it becomes the
+	///        entry the logprobs object is anchored on, as OpenAI clients expect
+	/// \note Call right after sampler->sample(). Only the first call has an
+	///       effect; later ones are ignored.
+	void _record_top_logprobs(chat_meta_info_t& meta_info, int sampled_token);
 
 	StreamResult _shared_think_tool_calling_pasrsed(const std::string content);
 

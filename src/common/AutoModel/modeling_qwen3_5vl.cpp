@@ -335,6 +335,7 @@ std::string Qwen3_5VL::generate(chat_meta_info_t& meta_info, int length_limit, s
         // First token of the reasoning block.
         this->_apply_tool_choice_mask(y, meta_info);
         sampled_token = this->sampler->sample(y);
+        this->_record_top_logprobs(meta_info, sampled_token);
         os << token_str << std::flush;
     }
     else{
@@ -364,6 +365,7 @@ std::string Qwen3_5VL::generate(chat_meta_info_t& meta_info, int length_limit, s
         // open a tool call right here, so it needs the mask too.
         this->_apply_tool_choice_mask(y, meta_info);
         sampled_token = this->sampler->sample(y);
+        this->_record_top_logprobs(meta_info, sampled_token);
     }
     this->total_tokens++;
     meta_info.generated_tokens++;
@@ -396,6 +398,7 @@ std::string Qwen3_5VL::generate(chat_meta_info_t& meta_info, int length_limit, s
         // tool_choice mask has to be applied here as well as in _shared_insert.
         this->_apply_tool_choice_mask(y, meta_info);
         int sampled_token = this->sampler->sample(y);
+        this->_record_top_logprobs(meta_info, sampled_token);
         this->profiler_list[SAMPLING_TIME].stop(1);
         this->total_tokens++;
         last_sampled_token = sampled_token;

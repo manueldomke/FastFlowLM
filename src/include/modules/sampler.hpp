@@ -51,6 +51,16 @@ public:
     int in_features;
     std::vector<int> counters;
     logits_list_t top_k_logits;
+
+    /// \brief The top-k of the most recently sampled token, before temperature.
+    ///
+    /// For /v1/*/logprobs. top_k_logits is overwritten by
+    /// sampler_temp_apply and softmax_inplace, so it is no longer raw by the
+    /// time the response is built; this copy is taken before that. The
+    /// temperature stays out of it deliberately -- callers that need a
+    /// distribution apply their own, which is what models trained for it
+    /// expect.
+    logits_list_t last_top_k;
     float rep_penalty;
     float freq_penalty;
     float pre_penalty;
